@@ -6,15 +6,17 @@ import snntorch as snn
 from snntorch import spikegen
 import matplotlib.pyplot as plt
 
+
 # 超参数设置
 batch_size = 32     # 训练批次设置，训练的规模，小规模的数据训练更快
-T_rate_coding = 10  # rate coding的时间窗口
+T_rate_coding = 30  # rate coding的时间窗口
 n_input = 784       # 对应MNIST的28*28像素
-n_hidden= 100       # 隐藏层神经元
+n_hidden= 200       # 隐藏层神经元
 n_output = 10       # 输出层神经元
-learn_rate_stdp = 0.001  # stdp学习率，用此来调节突触强度，这个参数是用来调节input和hidden之间的强度的
-learn_rate_supervisioned = 0.01     #监督学习学习率，同上，这个用于调节hidden和output之间的强度，最好比stdp权重大一点
-num_epocs = 3       # 训练轮数，这里训练三轮
+learn_rate_stdp = 0.0001  # stdp学习率，用此来调节突触强度，这个参数是用来调节input和hidden之间的强度的
+learn_rate_supervisioned = 0.001     #监督学习学习率，同上，这个用于调节hidden和output之间的强度，最好比stdp权重大一点
+num_epocs = 10       # 训练轮数，这里训练三轮
+
 
 # 设备设置：有GPU用GPU，没有用CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -26,14 +28,15 @@ transform = transforms.Compose([
     transforms.ToTensor(),  # 转成Tensor，这里我不是很理解
     transforms.Normalize((0,), (1,))  # 归一化到[0,1]，正好对应Rate Coding的脉冲概率
 ])
+print(111)
 
 # 加载训练集和测试集，只取前1000张训练、200张测试，验证用足够
 train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-train_dataset = torch.utils.data.Subset(train_dataset, range(1000))
+train_dataset = torch.utils.data.Subset(train_dataset, range(10000))
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
 test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-test_dataset = torch.utils.data.Subset(test_dataset, range(200))
+test_dataset = torch.utils.data.Subset(test_dataset, range(2000))
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # 最简单的rate coding函数
@@ -50,29 +53,34 @@ class STDP_SNN(nn.Module) :
         self.lif1 = snn.Leaky(beta = beta)      # 每一层fc连接的Lif神经元
         self.lif2 = snn.Leaky(beta = beta)
         # 初始化权重：小一点，避免初始脉冲太多
-        nn.init.normal_(self.fc1.weight, mean=0, std=0.01)
-        nn.init.normal_(self.fc2.weight, mean=0, std=0.01)
-
+#       nn.init.normal_(self.fc1.weight, mean=0, std=0.01)
+#       nn.init.normal_(self.fc2.weight, mean=0, std=0.01)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
     def forward (self, spike_seq) : #spike_seq是输入脉冲序列
         mem1 = self.lif1.init_leaky()   # 初始化膜电位，等价于我在LIF_5x2中的v
         mem2 = self.lif2.init_leaky()
         spike_rec1 = []  # 用于记录隐藏层输出的脉冲
         spike_rec2 = []  # 记录输出层的脉冲
+        mem2_rec = []
         for step in range(T_rate_coding):  # 时间步循环（从 0 到 T-1）
             # 输入层到隐藏层
             cur1 = self.fc1(spike_seq[step])
             spk1, mem1 = self.lif1(cur1, mem1)
             # 隐藏层到输出层
-            cur2 = self.fc2(spike_seq[spk1])
+            cur2 = self.fc2(spk1)
             spk2, mem2 = self.lif2(cur2, mem2)
             spike_rec1.append(spk1)
             spike_rec2.append(spk2)
+            mem2_rec.append(mem2)
         # 转成Tensor：(time_steps, batch_size, neurons)
-        spk1_rec = torch.stack(spk1_rec)
-        spk2_rec = torch.stack(spk2_rec)
+        spk1_rec = torch.stack(spike_rec1)
+        spk2_rec = torch.stack(spike_rec2)
+        mem2_rec = torch.stack(mem2_rec)
         # 记录每个输出层神经元在这个t_rate_code的总时间里
         output_spike_count = spk2_rec.sum(dim = 0)
-        return output_spike_count
+        output_logits = mem2_rec[-1]
+        return spk1_rec, output_spike_count, output_logits
 # STDP学习
 def stdp (fc1_w, input_spike, hidden_spike, lr = 0.001):    # fc1权重，输入层脉冲顺序，隐藏层脉冲顺序，stdp学习率
     # 全部转化为浮点数方便计算
@@ -114,20 +122,131 @@ def stdp (fc1_w, input_spike, hidden_spike, lr = 0.001):    # fc1权重，输入
     # 2. 突触后→突触前：post_trace * spk_pre → 权重减少
     delta_w_pos = torch.einsum("tbi,tbh->hbi", trace_pre, hidden_spike).mean(dim=1)  # 对批次平均
     delta_w_neg = torch.einsum("tbh,tbi->hbi", trace_post, input_spike).mean(dim=1)
-    fc1_w += delta_w_pos
-    fc1_w -= delta_w_neg
-    fc1_w *= lr
-    if (fc1_w >= 1) :
-        fc1_w = 1
-    elif (fc1_w <= -1):
-        fc1_w = -1
+    fc1_w += lr * (delta_w_pos - delta_w_neg)
+    fc1_w = torch.clamp(fc1_w, -1.0, 1.0)
     return fc1_w
 print(1111)
+# ====================== 第一阶段：STDP无监督预训练 ======================
+print("="*50)
+print("开始第一阶段：STDP无监督预训练（只学fc1特征）")
+print("="*50)
+
+# 重新初始化模型（或者用你之前训了一部分的模型也可以）
+model = STDP_SNN(n_input, n_hidden, n_output).to(device)
+# 预训练阶段：fc2暂时不需要梯度
+model.fc2.weight.requires_grad = False
+
+num_epochs_pretrain = 0 # STDP预训练5轮
+
+for epoch in range(num_epochs_pretrain):
+    print(f"STDP预训练 Epoch [{epoch+1}/{num_epochs_pretrain}]...")
+    for batch_idx, (data, _) in enumerate(train_loader): # 预训练不需要标签
+        data = data.to(device)
+        spike_seq = rate_coding(data, T_rate_coding)
+        # 前向传播，只需要隐藏层脉冲
+        spk1_rec, _, _= model(spike_seq)
+        # 只用STDP更新fc1
+        model.fc1.weight.data = stdp(
+            model.fc1.weight.data,
+            spike_seq,
+            spk1_rec,
+            lr = learn_rate_stdp
+        )
+
+print("STDP无监督预训练完成！")
+
+# 可视化一下预训练后的fc1权重，看看有没有学到特征
+print("可视化STDP预训练后的隐藏层权重...")
+weights_pretrain = model.fc1.weight.data[:10].cpu().numpy()
+plt.figure(figsize=(10, 4))
+for i in range(10):
+    plt.subplot(2, 5, i+1)
+    plt.imshow(weights_pretrain[i].reshape(28, 28), cmap='seismic')
+    plt.title(f'Pre-train Neuron {i+1}')
+    plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+# ====================== 第二阶段：监督微调 ======================
+print("="*50)
+print("开始第二阶段：监督微调（冻住fc1，只学fc2）")
+print("="*50)
+
+# ✅ 关键：冻住fc1，不让它再变了
+model.fc1.weight.requires_grad = False
+# 打开fc2的梯度
+model.fc2.weight.requires_grad = True
+
+# 优化器只优化fc2
+optimizer = optim.Adam(model.fc2.parameters(), lr=learn_rate_supervisioned)
+criterion = nn.CrossEntropyLoss()
+
+num_epochs_finetune = 10  # 监督微调10轮
+train_losses = []
+test_accs = []
+
+for epoch in range(num_epochs_finetune):
+    model.train()
+    total_loss = 0
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        spike_seq = rate_coding(data, T_rate_coding)
+        # 前向传播
+        _, output_logits, _ = model(spike_seq)
+        # 监督更新（只更新fc2）
+        optimizer.zero_grad()
+        loss = criterion(output_logits, target)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+    
+    avg_loss = total_loss / len(train_loader)
+    train_losses.append(avg_loss)
+    
+    # 测试
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            spike_seq = rate_coding(data, T_rate_coding)
+            _, _, output_spike_count = model(spike_seq)
+            _, pre_ans = torch.max(output_spike_count.data, 1)
+            total += target.size(0)
+            correct += (pre_ans == target).sum().item()
+    
+    test_acc = 100 * correct / total
+    test_accs.append(test_acc)
+    
+    print(f"微调 Epoch [{epoch+1}/{num_epochs_finetune}], Train Loss: {avg_loss:.4f}, Test Acc: {test_acc:.2f}%")
+
+# ====================== 可视化最终结果 ======================
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Train Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Fine-tuning Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(test_accs, label='Test Acc', color='orange')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.title('Fine-tuning Accuracy')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print("训练完成！")
 # vibe coding
 # ====================== 初始化模型和优化器 ======================
-model = STDP_SNN(n_input, n_hidden, n_output).to(device)
+"""model = STDP_SNN(n_input, n_hidden, n_output).to(device)
 # 只对隐藏层→输出层用监督优化器（STDP手动更新输入层→隐藏层）
-optimizer = optim.Adam(model.fc2.parameters(), lr=learn_rate_supervisioned)
+#optimizer = optim.Adam(model.fc2.parameters(), lr=learn_rate_supervisioned)
+optimizer = optim.Adam(model.parameters(), lr = learn_rate_supervisioned)
 criterion = nn.CrossEntropyLoss()  # 分类用交叉熵损失
 # vibe coding over
 # 训练流程
@@ -137,18 +256,18 @@ test_accs = []      # 用于记录每一轮训练精确度
 for i in range(num_epocs):
     model.train()   # 其实没啥用，但以后升级的时候可能有用
     total_loss = 0  # 记录总损失
-    for batch_idx, (date, target) in enumerate(train_loader):
-        date, target = date.to(device), target.to(device)   # 把date（图像数据）和target（实际数字）的信息都放到用于训练的device（cpu/gpu）上
-        spike_seq = rate_coding(date, T_rate_coding)        # 将图像编码化成频率编码
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)   # 把date（图像数据）和target（实际数字）的信息都放到用于训练的device（cpu/gpu）上
+        spike_seq = rate_coding(data, T_rate_coding)        # 将图像编码化成频率编码
         # 前向传播，得到隐藏层和输出层的脉冲序列
         spk1_rec, output_spk = model(spike_seq)
         # 手动更新 fc1：用模块 5 的 STDP 规则，传入 fc1 当前权重、输入层脉冲、隐藏层脉冲，得到更新后的权重，赋值给 fc1
-        model.fc1.weight.data = stdp(
-            model.fc1.weight.data,
-            spike_seq,
-            spk1_rec,
-            lr = learn_rate_stdp
-        )
+#        model.fc1.weight.data = stdp(
+#            model.fc1.weight.data,
+#            spike_seq,
+#            spk1_rec,
+#            lr = learn_rate_stdp
+#        )
         # 监督更新 fc2，上面优化器已经绑定fc2，所以优化器会自己来更新fc2，我只需提供参数即可
         optimizer.zero_grad()   # 优化器的梯度清零
         loss = criterion(output_spk, target)    # 计算交叉熵损失？这里没太懂什么意思，但大致应该是计算损失
@@ -157,7 +276,7 @@ for i in range(num_epocs):
 
         total_loss += loss.item()   # 计算总损失
     avg_loss= total_loss / len(train_loader)
-    train_loader.append(avg_loss)
+    train_losses.append(avg_loss)
     # 遍历每个批次测试
     model.eval()
     correct = 0     # 正确数
@@ -210,5 +329,4 @@ for i in range(10):
     plt.axis('off')
 plt.tight_layout()
 plt.show()
-
-print("训练完成！")
+print("训练完成！")"""
